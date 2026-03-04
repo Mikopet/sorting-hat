@@ -1,4 +1,5 @@
-use anyhow::Context as _;
+use poem::{get, handler, listener::TcpListener, Route, Server};
+
 use reqwest::StatusCode;
 use serenity::all::{ReactionType, RoleId};
 use serenity::async_trait;
@@ -16,6 +17,11 @@ struct Bot {
 #[async_trait]
 impl EventHandler for Bot {
     async fn message(&self, ctx: Context, msg: Message) {
+        // only answering user messages
+        if msg.author.bot {
+            return;
+        }
+
         if msg.content == "!activate" {
             // Reacting to notice user we are working
             let _ = msg
@@ -30,6 +36,7 @@ impl EventHandler for Bot {
                 .header("Authorization", format!("Basic {}", self.api_secret))
                 .send()
                 .await;
+            info!("activation request {}", msg.author.name);
 
             // Checking the API response
             let mut answer = "yay";
@@ -77,27 +84,29 @@ impl EventHandler for Bot {
     }
 }
 
-#[shuttle_runtime::main]
-async fn serenity(
-    #[shuttle_runtime::Secrets] secret_store: shuttle_runtime::SecretStore,
-) -> shuttle_serenity::ShuttleSerenity {
-    let token = secret_store
-        .get("DISCORD_TOKEN")
-        .context("DISCORD_TOKEN was not found")?;
+// #[instrument]
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+    #[cfg(debug_assertions)]
+    dotenv::dotenv().ok();
 
-    let role_id = secret_store
-        .get("DISCORD_ROLE_ID")
-        .context("DISCORD_ROLE_ID was not found")?
+    let web = tokio::spawn(async move {
+        let app = Route::new().at("/", get(health));
+        info!("healthcheck thread starting");
+        Server::new(TcpListener::bind("0.0.0.0:80"))
+            .name("sorting hat")
+            .run(app)
+            .await
+    });
+
+    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN was not found");
+    let api_url = std::env::var("API_URL").expect("API_URL was not found");
+    let api_secret = std::env::var("API_SECRET").expect("API_SECRET was not found");
+    let role_id = std::env::var("DISCORD_ROLE_ID")
+        .expect("DISCORD_ROLE_ID was not found")
         .parse::<u64>()
-        .context("DISCORD_ROLE_ID is not valid")?;
-
-    let api_url = secret_store
-        .get("API_URL")
-        .context("API_URL was not found")?;
-
-    let api_secret = secret_store
-        .get("API_SECRET")
-        .context("API_SECRET was not found")?;
+        .expect("DISCORD_ROLE_ID is not valid");
 
     let bot = Bot {
         api_url,
@@ -108,10 +117,23 @@ async fn serenity(
     // Set gateway intents, which decides what events the bot will be notified about
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
-    let client = Client::builder(&token, intents)
+    info!("Sorting Hat starting");
+
+    let mut client = Client::builder(&token, intents)
         .event_handler(bot)
         .await
         .expect("Err creating client");
 
-    Ok(client.into())
+    if let Err(why) = client.start().await {
+        println!("Client error: {why:?}");
+    }
+
+    web.await;
+
+    info!("Sorting Hat stopped");
+}
+
+#[handler]
+fn health() -> String {
+    format!("ok")
 }
